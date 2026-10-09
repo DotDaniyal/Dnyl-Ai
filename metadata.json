@@ -1,0 +1,6 @@
+{
+  "name": "DNYL",
+  "description": "Multilingual AI and real-time voice assistant with neural speech synthesis, automatic language detection, and an interactive holographic HUD interface.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

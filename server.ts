@@ -1,8 +1,10 @@
+import http from 'http';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { GoogleGenAI, Type } from '@google/genai';
+import { WebSocketServer, WebSocket } from 'ws';
+import { GoogleGenAI, LiveServerMessage, Modality, Type } from '@google/genai';
 
 dotenv.config();
 
@@ -10,6 +12,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+const server = http.createServer(app);
 const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: '15mb' }));
@@ -74,6 +77,7 @@ app.get('/api/dnyl/status', (_req, res) => {
     online: hasKey,
     models: {
       conversation: 'gemini-3.8-flash',
+      live: 'gemini-3.8-live',
       tts: 'gemini-3.8-flash-lite-tts',
       transcribe: 'gemini-3.5-transcribe',
     },
@@ -416,6 +420,186 @@ ${text.trim()}
   }
 });
 
+// ============================================================================
+// REAL-TIME VOICE CONVERSATION WEBSOCKET BRIDGE (Gemini Live API: gemini-3.8-live)
+// ============================================================================
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+  try {
+    const reqUrl = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
+    if (reqUrl.pathname === '/api/dnyl/live') {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+      });
+    }
+  } catch {
+    socket.destroy();
+  }
+});
+
+wss.on('connection', (clientWs: WebSocket, request: http.IncomingMessage) => {
+  const reqUrl = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
+  const requestedVoice = reqUrl.searchParams.get('voice') || 'Zephyr';
+  const preferredLang = reqUrl.searchParams.get('lang') || 'auto';
+
+  const validVoices = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
+  const voiceName = validVoices.includes(requestedVoice) ? requestedVoice : 'Zephyr';
+
+  const sendSafeJson = (payload: Record<string, unknown>) => {
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(JSON.stringify(payload));
+    }
+  };
+
+  let ai: GoogleGenAI;
+  try {
+    ai = getGenAIClient();
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'API key missing on server';
+    sendSafeJson({ type: 'error', error: msg });
+    clientWs.close();
+    return;
+  }
+
+  const languageDirective =
+    preferredLang && preferredLang !== 'auto'
+      ? `Always speak and respond in ${preferredLang} unless the user explicitly asks you to switch languages.`
+      : `Automatically detect the language spoken by the user (English, Urdu, Roman Urdu, Arabic, Hindi, Punjabi, Sindhi, Pashto, Persian, French, German, Spanish, Chinese, Japanese, Korean, Russian, Turkish, etc.) and respond naturally in that exact same language.`;
+
+  const liveSystemInstruction = `${DNYL_SYSTEM_INSTRUCTION}\n\nREAL-TIME VOICE MODE INSTRUCTIONS:\n- You are currently in low-latency, real-time bidirectional voice conversation mode.\n- Keep spoken responses natural, conversational, and well-paced for live audio.\n- ${languageDirective}`;
+
+  // Use sessionPromise pattern to avoid race conditions as required by Gemini Live API rules
+  const sessionPromise = ai.live.connect({
+    model: 'gemini-3.8-live',
+    config: {
+      responseModalities: [Modality.AUDIO],
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: { voiceName },
+        },
+      },
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
+      systemInstruction: liveSystemInstruction,
+    },
+    callbacks: {
+      onopen: () => {
+        sendSafeJson({
+          type: 'connected',
+          voiceName,
+          preferredLang,
+        });
+      },
+      onmessage: (message: LiveServerMessage) => {
+        // 1. Model audio output chunks (24kHz 16-bit PCM)
+        const parts = message.serverContent?.modelTurn?.parts;
+        if (parts && Array.isArray(parts)) {
+          for (const part of parts) {
+            if (part.inlineData?.data) {
+              sendSafeJson({
+                type: 'audio',
+                audio: part.inlineData.data,
+              });
+            }
+          }
+        }
+
+        // 2. Live input audio transcription (what the user said)
+        const inputTranscript = message.serverContent?.inputTranscription?.text;
+        if (inputTranscript) {
+          sendSafeJson({
+            type: 'input_transcription',
+            text: inputTranscript,
+          });
+        }
+
+        // 3. Live output audio transcription (what DNYL is saying)
+        const outputTranscript = message.serverContent?.outputTranscription?.text;
+        if (outputTranscript) {
+          sendSafeJson({
+            type: 'output_transcription',
+            text: outputTranscript,
+          });
+        }
+
+        // 4. Interruption handling (user spoke while DNYL was speaking)
+        if (message.serverContent?.interrupted) {
+          sendSafeJson({ type: 'interrupted' });
+        }
+
+        // 5. Turn completion
+        if (message.serverContent?.turnComplete) {
+          sendSafeJson({ type: 'turn_complete' });
+        }
+      },
+      onerror: (err: unknown) => {
+        const msg = err instanceof Error ? err.message : 'Live session error occurred';
+        console.error('[DNYL Live Error]:', msg);
+        sendSafeJson({ type: 'error', error: msg });
+      },
+      onclose: () => {
+        sendSafeJson({ type: 'closed' });
+      },
+    },
+  });
+
+  sessionPromise.catch((err: unknown) => {
+    const msg = err instanceof Error ? err.message : 'Failed to connect to Gemini Live API';
+    console.error('[DNYL Live Connect Failed]:', msg);
+    sendSafeJson({ type: 'error', error: msg });
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.close();
+    }
+  });
+
+  clientWs.on('message', (rawData) => {
+    try {
+      const parsed = JSON.parse(rawData.toString());
+      if (parsed.audio && typeof parsed.audio === 'string') {
+        sessionPromise
+          .then((session) => {
+            session.sendRealtimeInput({
+              audio: {
+                data: parsed.audio,
+                mimeType: 'audio/pcm;rate=16000',
+              },
+            });
+          })
+          .catch(() => {
+            // session closed or failed
+          });
+      } else if (parsed.text && typeof parsed.text === 'string') {
+        sessionPromise
+          .then((session) => {
+            session.sendRealtimeInput({
+              text: parsed.text,
+            });
+          })
+          .catch(() => {
+            // session closed or failed
+          });
+      }
+    } catch {
+      // ignore malformed JSON frames
+    }
+  });
+
+  clientWs.on('close', () => {
+    sessionPromise
+      .then((session) => {
+        try {
+          session.close();
+        } catch {
+          // ignore
+        }
+      })
+      .catch(() => {
+        // ignore
+      });
+  });
+});
+
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -432,8 +616,8 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`DNYL Server active on http://0.0.0.0:${PORT}`);
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`DNYL Server + Live WebSocket active on http://0.0.0.0:${PORT}`);
   });
 }
 

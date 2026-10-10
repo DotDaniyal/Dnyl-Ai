@@ -13,6 +13,8 @@ import {
   WifiOff,
   Sparkles,
   ExternalLink,
+  Radio,
+  PhoneOff,
 } from 'lucide-react';
 import {
   AssistantState,
@@ -29,6 +31,7 @@ import {
   ISpeechToTextProvider,
   NeuralCloudSTTProvider,
 } from './services/speechProviders';
+import { DNYLLiveSessionClient } from './services/liveSessionClient';
 import {
   createWelcomeMessage,
   evaluateSafeMath,
@@ -102,6 +105,13 @@ export default function App() {
     typeof navigator !== 'undefined' ? !navigator.onLine : false
   );
 
+  // Real-Time Gemini Live Conversation states
+  const [liveStatus, setLiveStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
+  const [liveMicMuted, setLiveMicMuted] = useState<boolean>(false);
+  const [liveAudioLevel, setLiveAudioLevel] = useState<number>(0);
+  const [liveUserTranscript, setLiveUserTranscript] = useState<string>('');
+  const [liveAssistantTranscript, setLiveAssistantTranscript] = useState<string>('');
+
   // Modals / Drawers / Active Tab
   const [isTranslationOpen, setIsTranslationOpen] = useState<boolean>(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
@@ -117,6 +127,7 @@ export default function App() {
   // Refs for providers and state synchronization
   const sttProviderRef = useRef<ISpeechToTextProvider | null>(null);
   const ttsSynthesizerRef = useRef<DNYLSpeechSynthesizer | null>(null);
+  const liveClientRef = useRef<DNYLLiveSessionClient | null>(null);
   const preferencesRef = useRef<DNYLPreferences>(preferences);
   const messagesRef = useRef<ChatMessage[]>(messages);
   const isStandbyRef = useRef<boolean>(isStandby);
@@ -163,6 +174,11 @@ export default function App() {
     }
   }, [preferences]);
 
+  // Update Live client volume dynamically
+  useEffect(() => {
+    liveClientRef.current?.setVolume(preferences.speechVolume);
+  }, [preferences.speechVolume]);
+
   // Save messages to localStorage if memoryEnabled
   useEffect(() => {
     try {
@@ -178,22 +194,82 @@ export default function App() {
   useEffect(() => {
     if (isStandby) {
       setAssistantState('standby');
-    } else if (isProcessing) {
+    } else if (isProcessing || liveStatus === 'connecting') {
       setAssistantState('processing');
     } else if (isSpeaking) {
       setAssistantState('speaking');
-    } else if (isListening) {
+    } else if (isListening || (liveStatus === 'connected' && !liveMicMuted)) {
       setAssistantState('listening');
     } else {
       setAssistantState('idle');
     }
-  }, [isStandby, isProcessing, isSpeaking, isListening]);
+  }, [isStandby, isProcessing, isSpeaking, isListening, liveStatus, liveMicMuted]);
 
-  // Initialize TTS synthesizer once
+  // Initialize TTS synthesizer and Live Session client once
   useEffect(() => {
     ttsSynthesizerRef.current = new DNYLSpeechSynthesizer();
+    liveClientRef.current = new DNYLLiveSessionClient({
+      onStatusChange: (status) => {
+        setLiveStatus(status);
+        if (status === 'disconnected') {
+          setLiveUserTranscript('');
+          setLiveAssistantTranscript('');
+          setLiveAudioLevel(0);
+          setLiveMicMuted(false);
+        }
+      },
+      onSpeakingChange: (speaking) => {
+        setIsSpeaking(speaking);
+      },
+      onUserTranscriptUpdate: (partial) => {
+        setLiveUserTranscript(partial);
+      },
+      onAssistantTranscriptUpdate: (partial) => {
+        setLiveAssistantTranscript(partial);
+      },
+      onTurnCompleted: (userText, assistantText) => {
+        const nowIso = new Date().toISOString();
+        const newEntries: ChatMessage[] = [];
+        if (userText) {
+          const uDir = detectScriptDirection(userText, 'ltr');
+          newEntries.push({
+            id: `live-user-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            role: 'user',
+            text: userText,
+            timestamp: nowIso,
+            languageCode: preferencesRef.current.sttRecognitionLang,
+            languageName: 'Live Voice',
+            direction: uDir,
+          });
+        }
+        if (assistantText) {
+          const aDir = detectScriptDirection(assistantText, 'ltr');
+          newEntries.push({
+            id: `live-dnyl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            role: 'assistant',
+            text: assistantText,
+            spokenSummary: assistantText,
+            timestamp: nowIso,
+            languageCode: preferencesRef.current.sttRecognitionLang,
+            languageName: 'Live Voice',
+            direction: aDir,
+          });
+        }
+        if (newEntries.length > 0) {
+          setMessages((prev) => [...prev, ...newEntries]);
+        }
+      },
+      onAudioLevel: (lvl) => {
+        setLiveAudioLevel(lvl);
+      },
+      onError: (errMsg) => {
+        setErrorBanner(errMsg);
+      },
+    });
+
     return () => {
       ttsSynthesizerRef.current?.stop();
+      liveClientRef.current?.disconnect();
     };
   }, []);
 
@@ -203,7 +279,6 @@ export default function App() {
       if (!ttsSynthesizerRef.current || isStandbyRef.current) return;
       const prefs = preferencesRef.current;
 
-      // Pause microphone recognition while DNYL speaks to prevent self-echo loop
       sttProviderRef.current?.pauseForAssistantSpeech();
 
       ttsSynthesizerRef.current.speak({
@@ -234,8 +309,47 @@ export default function App() {
 
   const handleStopSpeaking = useCallback(() => {
     ttsSynthesizerRef.current?.stop();
+    liveClientRef.current?.clearPlaybackQueue();
     setIsSpeaking(false);
     sttProviderRef.current?.resumeAfterAssistantSpeech();
+  }, []);
+
+  // Toggle Real-Time Gemini Live Conversation
+  const handleToggleLiveSession = useCallback(async () => {
+    if (isStandby) return;
+    setErrorBanner(null);
+
+    if (liveStatus === 'connected' || liveStatus === 'connecting') {
+      liveClientRef.current?.disconnect();
+      return;
+    }
+
+    // Stop standard STT/TTS before opening full-duplex Live session
+    sttProviderRef.current?.stop();
+    ttsSynthesizerRef.current?.stop();
+    setIsListening(false);
+    setIsSpeaking(false);
+    setInterimTranscript('');
+
+    await liveClientRef.current?.connect(
+      preferences.neuralVoice,
+      preferences.preferredLanguage,
+      preferences.speechVolume
+    );
+  }, [
+    isStandby,
+    liveStatus,
+    preferences.neuralVoice,
+    preferences.preferredLanguage,
+    preferences.speechVolume,
+  ]);
+
+  const handleToggleLiveMicMute = useCallback(() => {
+    setLiveMicMuted((prev) => {
+      const next = !prev;
+      liveClientRef.current?.setMicMuted(next);
+      return next;
+    });
   }, []);
 
   // Core message sending & AI conversation handler
@@ -246,7 +360,28 @@ export default function App() {
 
       setErrorBanner(null);
 
-      // If DNYL is currently speaking and interruption handling is enabled, stop speech immediately
+      // If Real-Time Live Session is currently connected, send text into the Live session or run local utility
+      if (liveStatus === 'connected') {
+        const localCheck = processLocalUtilityCommand(trimmed, !navigator.onLine);
+        if (!localCheck.handled) {
+          liveClientRef.current?.sendTextMessage(trimmed);
+          const uDir = detectScriptDirection(trimmed, 'ltr');
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `user-${Date.now()}`,
+              role: 'user',
+              text: trimmed,
+              timestamp: new Date().toISOString(),
+              languageCode: preferencesRef.current.sttRecognitionLang,
+              languageName: 'Live Text',
+              direction: uDir,
+            },
+          ]);
+          return;
+        }
+      }
+
       if (preferencesRef.current.interruptOnSpeech && ttsSynthesizerRef.current?.isSpeaking()) {
         handleStopSpeaking();
       }
@@ -272,7 +407,7 @@ export default function App() {
       setMessages((prev) => [...prev, userMessage]);
       setIsProcessing(true);
 
-      // 1. Check local / offline command engine first (instant math, date/time, website launch, or offline mode)
+      // 1. Check local / offline command engine first
       const localResult = processLocalUtilityCommand(trimmed, !navigator.onLine);
       if (localResult.handled && localResult.reply) {
         const assistantMsg: ChatMessage = {
@@ -292,7 +427,7 @@ export default function App() {
         setMessages((prev) => [...prev, assistantMsg]);
         setIsProcessing(false);
 
-        if (preferencesRef.current.autoSpeakResponses && assistantMsg.spokenSummary) {
+        if (preferencesRef.current.autoSpeakResponses && assistantMsg.spokenSummary && liveStatus !== 'connected') {
           speakText(assistantMsg.spokenSummary, 'en-US', 'English');
         }
         return;
@@ -362,7 +497,7 @@ export default function App() {
         setErrorBanner(errMsg);
       }
     },
-    [handleStopSpeaking, speakText]
+    [handleStopSpeaking, liveStatus, speakText]
   );
 
   handleSendMessageRef.current = handleSendMessage;
@@ -408,10 +543,15 @@ export default function App() {
     };
   }, [preferences.sttProvider]);
 
-  // Toggle Microphone Listening
+  // Toggle Voice Dictation Listening
   const handleToggleListening = useCallback(async () => {
     if (isStandby) return;
     setErrorBanner(null);
+
+    if (liveStatus === 'connected') {
+      handleToggleLiveMicMute();
+      return;
+    }
 
     if (isListening) {
       sttProviderRef.current?.stop();
@@ -427,10 +567,12 @@ export default function App() {
     }
   }, [
     isStandby,
+    liveStatus,
     isListening,
     preferences.interruptOnSpeech,
     preferences.sttRecognitionLang,
     preferences.continuousListening,
+    handleToggleLiveMicMute,
     handleStopSpeaking,
   ]);
 
@@ -451,6 +593,7 @@ export default function App() {
   // Toggle Standby / Wake
   const handleToggleStandby = () => {
     if (!isStandby) {
+      liveClientRef.current?.disconnect();
       sttProviderRef.current?.stop();
       ttsSynthesizerRef.current?.stop();
       setIsListening(false);
@@ -466,7 +609,6 @@ export default function App() {
   const updatePreferences = (patch: Partial<DNYLPreferences>) => {
     setPreferences((prev) => {
       const updated = { ...prev, ...patch };
-      // If recognition language changed while listening, restart listener with new language
       if (patch.sttRecognitionLang && isListening) {
         sttProviderRef.current?.stop();
         window.setTimeout(() => {
@@ -528,6 +670,8 @@ export default function App() {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     Boolean((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
 
+  const isLiveActive = liveStatus === 'connected' || liveStatus === 'connecting';
+
   return (
     <div className="min-h-screen flex flex-col bg-[#050914] text-slate-100">
       {/* Top Bar Contract: Strictly 3 Zones separated by gap-8 */}
@@ -572,19 +716,29 @@ export default function App() {
           </button>
         </nav>
 
-        {/* Zone 3: 1 primary action */}
+        {/* Zone 3: 1 primary action (Real-Time Live Conversation Toggle) */}
         <div className="flex items-center gap-3 shrink-0">
           <button
             type="button"
             disabled={isStandby}
-            onClick={handleToggleListening}
-            className={`px-4 py-2 text-xs font-semibold rounded-xl transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 ${
-              isListening
-                ? 'bg-cyan-400 text-slate-950 shadow-[0_0_20px_rgba(34,211,238,0.4)]'
-                : 'bg-cyan-500/20 text-cyan-200 border border-cyan-400/40 hover:bg-cyan-500/30'
+            onClick={handleToggleLiveSession}
+            className={`flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-xl transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 ${
+              isLiveActive
+                ? 'bg-red-500/25 text-red-200 border border-red-500/50 hover:bg-red-500/35'
+                : 'bg-cyan-400 text-slate-950 hover:bg-cyan-300 shadow-[0_0_20px_rgba(34,211,238,0.35)]'
             }`}
           >
-            {isListening ? 'Stop Voice Listening' : 'Start Voice Listening'}
+            {isLiveActive ? (
+              <>
+                <PhoneOff className="w-3.5 h-3.5" />
+                <span>End Live Voice</span>
+              </>
+            ) : (
+              <>
+                <Radio className="w-3.5 h-3.5" />
+                <span>Start Live Voice</span>
+              </>
+            )}
           </button>
         </div>
       </header>
@@ -622,9 +776,14 @@ export default function App() {
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch flex-1">
           {/* Left Column (5 cols on Desktop): Reactor Core + Multilingual / Utility Deck */}
           <div className="lg:col-span-5 flex flex-col gap-6">
-            {/* Central Animated Reactor & Voice Controller */}
+            {/* Central Animated Reactor & Real-Time Live Voice Controller */}
             <HudReactorCore
               state={assistantState}
+              liveStatus={liveStatus}
+              liveMicMuted={liveMicMuted}
+              liveAudioLevel={liveAudioLevel}
+              liveUserTranscript={liveUserTranscript}
+              liveAssistantTranscript={liveAssistantTranscript}
               interimTranscript={interimTranscript}
               activeLanguageName={
                 preferences.preferredLanguage === 'auto'
@@ -635,6 +794,8 @@ export default function App() {
               continuousListening={preferences.continuousListening}
               isStandby={isStandby}
               canRepeatLast={Boolean(lastAssistantMessage)}
+              onToggleLiveSession={handleToggleLiveSession}
+              onToggleLiveMicMute={handleToggleLiveMicMute}
               onToggleListening={handleToggleListening}
               onStopSpeaking={handleStopSpeaking}
               onRepeatLast={handleRepeatLast}
@@ -723,7 +884,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Interactive Language Grid — Click any language to set mic & test a native prompt */}
+                  {/* Interactive Language Grid */}
                   <div>
                     <p className="text-xs text-slate-400 mb-2">
                       Select any language below to switch voice input or send a native test prompt:
@@ -881,7 +1042,7 @@ export default function App() {
           </div>
 
           {/* Right Column (7 cols on Desktop): Multilingual Conversation Console */}
-          <div className="lg:col-span-7 flex flex-col rounded-2xl bg-[#081022]/90 border border-cyan-500/20 overflow-hidden min-h-[640px] max-h-[840px]">
+          <div className="lg:col-span-7 flex flex-col rounded-2xl bg-[#081022]/90 border border-cyan-500/20 overflow-hidden min-h-[640px] max-h-[860px]">
             {/* Console Toolbar */}
             <div className="px-5 py-3.5 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 bg-[#060c1a]/70">
               <div className="flex items-center gap-2 text-xs text-slate-300">
@@ -891,6 +1052,14 @@ export default function App() {
                 </span>
                 <span aria-hidden="true">·</span>
                 <span className="font-mono">{messages.length} entries</span>
+                {liveStatus === 'connected' && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span className="text-cyan-300 font-medium">
+                      Live Duplex Active
+                    </span>
+                  </>
+                )}
               </div>
 
               {/* Search & Audio Controls */}
@@ -1036,7 +1205,7 @@ export default function App() {
                   onClick={handleToggleListening}
                   title={
                     isListening
-                      ? 'Stop Microphone Recognition'
+                      ? 'Stop Microphone Dictation'
                       : 'Speak in your selected language'
                   }
                   className={`p-3 rounded-xl border transition-colors shrink-0 cursor-pointer disabled:opacity-40 ${
